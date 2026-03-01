@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 
-# Evaluation prompt (same as model_evaluation.py)
+# Enhanced evaluation prompt with reasoning
 prompt_template = """
 You are an advertising expert specializing in evaluating whether a respondent's answer after watching a video matches the golden answer. We will provide the video's Meta-Information, Question, Golden Answer, and the Response to be judged below.
 
@@ -36,10 +36,15 @@ You are an advertising expert specializing in evaluating whether a respondent's 
 {response}
 
 ###Instructions:
-Follow the format below and do not give any extra outputs:
-Answer: 0 (if the response does not match)
-Answer: 0.5 (if the response partially match)
-Answer: 1 (if the response matches)
+Provide your evaluation in the following format:
+
+Answer: [0 or 0.5 or 1]
+
+Missing Information:
+[List specific key information from the golden answer that is MISSING or INCOMPLETE in the response. If nothing is missing, write "None"]
+
+Hallucinations/Errors:
+[List specific claims in the response that CONTRADICT the meta-information or golden answer. If no contradictions, write "None"]
 """
 
 
@@ -63,7 +68,11 @@ def evaluate_with_qwen(model, tokenizer, meta_info, question, golden_answer, res
         response: Model's answer to evaluate
 
     Returns:
-        Score string in format "Answer: X" where X is 0, 0.5, or 1
+        Dictionary with:
+        - score: Score string in format "Answer: X" where X is 0, 0.5, or 1
+        - missing_info: String describing missing information
+        - hallucinations: String describing hallucinations/errors
+        - full_response: Complete model response
     """
     # Format prompt
     prompt = prompt_template.format(
@@ -100,7 +109,34 @@ def evaluate_with_qwen(model, tokenizer, meta_info, question, golden_answer, res
     generated = outputs[0][inputs["input_ids"].shape[-1]:]
     response_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
-    return response_text
+    # Parse response
+    result = {
+        "score": "",
+        "missing_info": "",
+        "hallucinations": "",
+        "full_response": response_text
+    }
+
+    # Extract score
+    score_match = re.search(r'Answer:\s*(0\.5|0|1)', response_text)
+    if score_match:
+        result["score"] = f"Answer: {score_match.group(1)}"
+
+    # Extract missing information
+    missing_match = re.search(r'Missing Information:\s*(.*?)(?=Hallucinations/Errors:|$)', response_text, re.DOTALL)
+    if missing_match:
+        missing_text = missing_match.group(1).strip()
+        if missing_text.lower() not in ["none", "none.", ""]:
+            result["missing_info"] = missing_text
+
+    # Extract hallucinations
+    halluc_match = re.search(r'Hallucinations/Errors:\s*(.*?)$', response_text, re.DOTALL)
+    if halluc_match:
+        halluc_text = halluc_match.group(1).strip()
+        if halluc_text.lower() not in ["none", "none.", ""]:
+            result["hallucinations"] = halluc_text
+
+    return result
 
 
 if __name__ == '__main__':
@@ -171,7 +207,7 @@ if __name__ == '__main__':
 
         # Check if already evaluated
         pred_score = pred_item[0].get('score', '')
-        if pred_score != "":
+        if pred_score != "" and pred_score is not None:
             # Already evaluated, parse existing score
             gptscore = pred_score.replace('Answer: ', '').strip()
             pred_answer = pred_item[0]['prediction']
@@ -220,7 +256,7 @@ if __name__ == '__main__':
 
         # Evaluate with Qwen2.5-7B
         try:
-            gptscore = evaluate_with_qwen(
+            eval_result = evaluate_with_qwen(
                 model, tokenizer,
                 meta_info, question, gt_answer, pred_answer
             )
@@ -228,15 +264,19 @@ if __name__ == '__main__':
             print(f"\nError during evaluation of {question_id}: {e}")
             continue
 
-        # Save score back to file
-        pred_item[0]['score'] = gptscore
+        # Save score and reasoning back to file
+        pred_item[0]['score'] = eval_result['score']
+        pred_item[0]['missing_info'] = eval_result['missing_info']
+        pred_item[0]['hallucinations'] = eval_result['hallucinations']
+        pred_item[0]['evaluation_reasoning'] = eval_result['full_response']
+
         with open(pred_path, 'w', encoding='utf-8') as ff:
             json.dump(pred_item, ff, indent=4, ensure_ascii=False)
 
         # Parse and update metrics
         try:
             pred_nums += 1
-            gptscore_clean = gptscore.replace('Answer: ', '').strip()
+            gptscore_clean = eval_result['score'].replace('Answer: ', '').strip()
 
             if '1' in gptscore_clean:
                 strict_acc += 1
@@ -261,10 +301,14 @@ if __name__ == '__main__':
                 relax_acc_counts[typee] += 1
 
             print(f"\n{question_id}: {gptscore_clean}")
+            if eval_result['missing_info']:
+                print(f"  Missing: {eval_result['missing_info'][:100]}...")
+            if eval_result['hallucinations']:
+                print(f"  Hallucinations: {eval_result['hallucinations'][:100]}...")
 
         except Exception as e:
             print(f"\nError parsing score for {question_id}: {e}")
-            print(f"Score returned: {gptscore}")
+            print(f"Evaluation result: {eval_result}")
 
     # Print final results
     print("\n" + "="*50)

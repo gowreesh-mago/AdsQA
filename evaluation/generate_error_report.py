@@ -11,7 +11,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from error_analysis import ErrorAnalyzer
 from explanation_analyzer import ExplanationAnalyzer
 
 
@@ -46,9 +45,8 @@ def generate_comprehensive_report(
     Returns:
         Dictionary containing the complete error report
     """
-    # Initialize analyzers
-    print("Initializing error and explanation analyzers...")
-    error_analyzer = ErrorAnalyzer(model, tokenizer)
+    # Initialize analyzer
+    print("Initializing explanation analyzer...")
     explanation_analyzer = ExplanationAnalyzer(model, tokenizer)
 
     # Load ground truth
@@ -79,7 +77,6 @@ def generate_comprehensive_report(
             "score_0.5": 0,
             "score_1": 0
         },
-        "question_type_analysis": {},
         "detailed_errors": []
     }
 
@@ -100,9 +97,11 @@ def generate_comprehensive_report(
             print(f"\nWarning: Failed to load {pred_path}: {e}")
             continue
 
-        # Extract prediction and score
+        # Extract prediction, score, and reasoning
         prediction = pred_data[0].get("prediction", "")
         score_str = pred_data[0].get("score", "")
+        missing_info = pred_data[0].get("missing_info", "")
+        hallucinations = pred_data[0].get("hallucinations", "")
 
         if not prediction:
             continue
@@ -122,57 +121,64 @@ def generate_comprehensive_report(
             report["score_distribution"]["score_1"] += 1
             report["perfect_scores"] += 1
 
-        # Initialize question type tracking
-        question_types = item.get("question_type", [])
-        for qtype in question_types:
-            if qtype not in report["question_type_analysis"]:
-                report["question_type_analysis"][qtype] = {
-                    "total": 0,
-                    "perfect_scores": 0,
-                    "format_errors": 0,
-                    "hallucinations": 0,
-                    "missing_information": 0,
-                    "avg_score": 0,
-                    "score_sum": 0
-                }
-            report["question_type_analysis"][qtype]["total"] += 1
-            report["question_type_analysis"][qtype]["score_sum"] += score if score is not None else 0
-
         # Skip perfect scores (no errors to analyze)
         if score == 1.0:
-            for qtype in question_types:
-                report["question_type_analysis"][qtype]["perfect_scores"] += 1
             continue
 
         # Get ground truth info
         ground_truth = item.get("answer", item.get("gt_answer", ""))
         meta_info = item.get("meta_info", "")
+        question_types = item.get("question_type", [])
 
-        # Categorize errors
-        errors = error_analyzer.categorize_error(
-            prediction,
-            ground_truth,
-            meta_info,
-            score
-        )
+        # Categorize errors based on saved reasoning
+        errors = []
+
+        # 1. Format check
+        if not ("<think>" in prediction and "</think>" in prediction and
+                "<answer>" in prediction and "</answer>" in prediction):
+            issues = []
+            if "<think>" not in prediction or "</think>" not in prediction:
+                issues.append("Missing <think> tags")
+            if "<answer>" not in prediction or "</answer>" not in prediction:
+                issues.append("Missing <answer> tags")
+            errors.append({
+                "category": "Format Error",
+                "detail": ", ".join(issues)
+            })
+            report["error_summary"]["Format Error"] += 1
+
+        # 2. Missing Information (from evaluation)
+        if missing_info and missing_info.strip():
+            errors.append({
+                "category": "Missing Information",
+                "detail": missing_info
+            })
+            report["error_summary"]["Missing Information"] += 1
+
+        # 3. Hallucinations (from evaluation)
+        if hallucinations and hallucinations.strip():
+            errors.append({
+                "category": "Hallucination",
+                "detail": hallucinations
+            })
+            report["error_summary"]["Hallucination"] += 1
+
+        # 4. Score-based categorization
+        if score == 0:
+            errors.append({
+                "category": "Complete Mismatch",
+                "detail": "Prediction has no overlap with ground truth"
+            })
+            report["error_summary"]["Complete Mismatch"] += 1
+        elif score == 0.5:
+            errors.append({
+                "category": "Partial Match",
+                "detail": "Contains some correct information but incomplete"
+            })
+            report["error_summary"]["Partial Match"] += 1
 
         # Analyze explanation differences
         exp_analysis = explanation_analyzer.compare_explanations(prediction, item)
-
-        # Update error summary
-        for error in errors:
-            category = error["category"]
-            if category in report["error_summary"]:
-                report["error_summary"][category] += 1
-
-            # Update question type analysis
-            for qtype in question_types:
-                if category == "Format Error":
-                    report["question_type_analysis"][qtype]["format_errors"] += 1
-                elif category == "Hallucination":
-                    report["question_type_analysis"][qtype]["hallucinations"] += 1
-                elif category == "Missing Information":
-                    report["question_type_analysis"][qtype]["missing_information"] += 1
 
         # Add to detailed errors
         report["detailed_errors"].append({
@@ -186,11 +192,6 @@ def generate_comprehensive_report(
             "meta_info": meta_info,
             "explanation_analysis": exp_analysis
         })
-
-    # Calculate averages for question types
-    for qtype, stats in report["question_type_analysis"].items():
-        if stats["total"] > 0:
-            stats["avg_score"] = stats["score_sum"] / stats["total"]
 
     # Add overall insights
     total_errors = len(report["detailed_errors"])
@@ -243,18 +244,6 @@ def generate_comprehensive_report(
     print(f"  Hallucination Rate: {report['overall_insights']['hallucination_prevalence']:.1f}% of errors")
     print(f"  Missing Information Rate: {report['overall_insights']['missing_information_prevalence']:.1f}% of errors")
     print(f"  Format Error Rate: {report['overall_insights']['format_error_rate']:.1f}% of evaluated questions")
-
-    print("\n" + "-"*70)
-    print("PER-QUESTION-TYPE ANALYSIS")
-    print("-"*70)
-    for qtype, stats in sorted(report["question_type_analysis"].items()):
-        print(f"\n  {qtype}:")
-        print(f"    Total: {stats['total']}")
-        print(f"    Avg Score: {stats['avg_score']:.2f}")
-        print(f"    Perfect: {stats['perfect_scores']} ({stats['perfect_scores']/stats['total']*100:.1f}%)")
-        print(f"    Format Errors: {stats['format_errors']}")
-        print(f"    Hallucinations: {stats['hallucinations']}")
-        print(f"    Missing Info: {stats['missing_information']}")
 
     print("\n" + "="*70)
     print(f"Report saved to: {output_path}")
