@@ -88,9 +88,9 @@ def get_qwen3vl_response(model, processor, video_path, question):
     # Inference
     generated_ids = model.generate(
         **inputs,
-        max_new_tokens=1524,
         do_sample=True,
-        temperature=1.0
+        temperature=0.3,
+        max_new_tokens=1524
     )
 
     # Extract generated tokens
@@ -102,7 +102,7 @@ def get_qwen3vl_response(model, processor, video_path, question):
     output_text = processor.batch_decode(
         generated_ids_trimmed,
         skip_special_tokens=True,
-        clean_up_tokenization_spaces=True
+        clean_up_tokenization_spaces=False
     )
 
     return output_text[0].strip()
@@ -194,13 +194,7 @@ if __name__ == "__main__":
                 continue
 
             # Format question with instruction
-            input_question = (
-                f"{asr}\n\nQuestion: {question}\n\n"
-                "You are permitted to gather any relevant clues, think step by step, to answer this question. "
-                "Output your thought process (no length limit) and the final answer (using approximately 30 words; "
-                "longer answers will be truncated) in the following format\n"
-                "<think>your_thinking</think> <answer>your_answer_within_30_words</answer>"
-            )
+            input_question = f"{asr}\n\n Question: {question}\n\nYou are permitted to gather any relevant clues, think step by step, to answer this question. Output your thought process (no length limit) and the final answer (using approximately 30 words; longer answers will be truncated) in the following format\n <think>your_thinking</think> <answer>your_answer_within_30_words</answer>"
 
             # Get model prediction
             print("  Running inference...")

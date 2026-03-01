@@ -66,6 +66,7 @@ def generate_comprehensive_report(
         "model": eval_name,
         "total_questions": len(groundtruth),
         "evaluated_questions": 0,
+        "perfect_scores": 0,
         "error_summary": {
             "Format Error": 0,
             "Complete Mismatch": 0,
@@ -73,6 +74,12 @@ def generate_comprehensive_report(
             "Hallucination": 0,
             "Missing Information": 0
         },
+        "score_distribution": {
+            "score_0": 0,
+            "score_0.5": 0,
+            "score_1": 0
+        },
+        "question_type_analysis": {},
         "detailed_errors": []
     }
 
@@ -106,8 +113,35 @@ def generate_comprehensive_report(
 
         report["evaluated_questions"] += 1
 
+        # Track score distribution
+        if score == 0:
+            report["score_distribution"]["score_0"] += 1
+        elif score == 0.5:
+            report["score_distribution"]["score_0.5"] += 1
+        elif score == 1.0:
+            report["score_distribution"]["score_1"] += 1
+            report["perfect_scores"] += 1
+
+        # Initialize question type tracking
+        question_types = item.get("question_type", [])
+        for qtype in question_types:
+            if qtype not in report["question_type_analysis"]:
+                report["question_type_analysis"][qtype] = {
+                    "total": 0,
+                    "perfect_scores": 0,
+                    "format_errors": 0,
+                    "hallucinations": 0,
+                    "missing_information": 0,
+                    "avg_score": 0,
+                    "score_sum": 0
+                }
+            report["question_type_analysis"][qtype]["total"] += 1
+            report["question_type_analysis"][qtype]["score_sum"] += score if score is not None else 0
+
         # Skip perfect scores (no errors to analyze)
         if score == 1.0:
+            for qtype in question_types:
+                report["question_type_analysis"][qtype]["perfect_scores"] += 1
             continue
 
         # Get ground truth info
@@ -131,11 +165,20 @@ def generate_comprehensive_report(
             if category in report["error_summary"]:
                 report["error_summary"][category] += 1
 
+            # Update question type analysis
+            for qtype in question_types:
+                if category == "Format Error":
+                    report["question_type_analysis"][qtype]["format_errors"] += 1
+                elif category == "Hallucination":
+                    report["question_type_analysis"][qtype]["hallucinations"] += 1
+                elif category == "Missing Information":
+                    report["question_type_analysis"][qtype]["missing_information"] += 1
+
         # Add to detailed errors
         report["detailed_errors"].append({
             "question_id": question_id,
             "question": item.get("question", ""),
-            "question_type": item.get("question_type", []),
+            "question_type": question_types,
             "score": score,
             "errors": errors,
             "prediction": prediction,
@@ -144,6 +187,25 @@ def generate_comprehensive_report(
             "explanation_analysis": exp_analysis
         })
 
+    # Calculate averages for question types
+    for qtype, stats in report["question_type_analysis"].items():
+        if stats["total"] > 0:
+            stats["avg_score"] = stats["score_sum"] / stats["total"]
+
+    # Add overall insights
+    total_errors = len(report["detailed_errors"])
+    hallucination_count = report["error_summary"]["Hallucination"]
+    missing_info_count = report["error_summary"]["Missing Information"]
+
+    report["overall_insights"] = {
+        "error_rate": (total_errors / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0,
+        "perfect_score_rate": (report["perfect_scores"] / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0,
+        "hallucination_prevalence": (hallucination_count / total_errors * 100) if total_errors > 0 else 0,
+        "missing_information_prevalence": (missing_info_count / total_errors * 100) if total_errors > 0 else 0,
+        "primary_issue": "Hallucination" if hallucination_count > missing_info_count else "Missing Information" if missing_info_count > hallucination_count else "Both equally prevalent",
+        "format_error_rate": (report["error_summary"]["Format Error"] / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0
+    }
+
     # Save report
     print(f"\nSaving error report to: {output_path}")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -151,19 +213,52 @@ def generate_comprehensive_report(
         json.dump(report, f, indent=2, ensure_ascii=False)
 
     # Print summary
-    print("\n" + "="*50)
+    print("\n" + "="*70)
     print("ERROR REPORT SUMMARY")
-    print("="*50)
+    print("="*70)
     print(f"Model: {report['model']}")
     print(f"Total Questions: {report['total_questions']}")
     print(f"Evaluated: {report['evaluated_questions']}")
-    print(f"Errors Found: {len(report['detailed_errors'])}")
+    print(f"Perfect Scores: {report['perfect_scores']} ({report['overall_insights']['perfect_score_rate']:.1f}%)")
+    print(f"Errors Found: {total_errors} ({report['overall_insights']['error_rate']:.1f}%)")
 
-    print("\nError Categories:")
+    print("\n" + "-"*70)
+    print("SCORE DISTRIBUTION")
+    print("-"*70)
+    for score_type, count in report["score_distribution"].items():
+        percentage = (count / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0
+        print(f"  {score_type}: {count} ({percentage:.1f}%)")
+
+    print("\n" + "-"*70)
+    print("ERROR CATEGORIES")
+    print("-"*70)
     for category, count in report["error_summary"].items():
-        print(f"  {category}: {count}")
+        percentage = (count / total_errors * 100) if total_errors > 0 else 0
+        print(f"  {category}: {count} ({percentage:.1f}% of errors)")
 
-    print(f"\nReport saved to: {output_path}")
+    print("\n" + "-"*70)
+    print("KEY INSIGHTS")
+    print("-"*70)
+    print(f"  Primary Issue: {report['overall_insights']['primary_issue']}")
+    print(f"  Hallucination Rate: {report['overall_insights']['hallucination_prevalence']:.1f}% of errors")
+    print(f"  Missing Information Rate: {report['overall_insights']['missing_information_prevalence']:.1f}% of errors")
+    print(f"  Format Error Rate: {report['overall_insights']['format_error_rate']:.1f}% of evaluated questions")
+
+    print("\n" + "-"*70)
+    print("PER-QUESTION-TYPE ANALYSIS")
+    print("-"*70)
+    for qtype, stats in sorted(report["question_type_analysis"].items()):
+        print(f"\n  {qtype}:")
+        print(f"    Total: {stats['total']}")
+        print(f"    Avg Score: {stats['avg_score']:.2f}")
+        print(f"    Perfect: {stats['perfect_scores']} ({stats['perfect_scores']/stats['total']*100:.1f}%)")
+        print(f"    Format Errors: {stats['format_errors']}")
+        print(f"    Hallucinations: {stats['hallucinations']}")
+        print(f"    Missing Info: {stats['missing_information']}")
+
+    print("\n" + "="*70)
+    print(f"Report saved to: {output_path}")
+    print("="*70)
 
     return report
 
