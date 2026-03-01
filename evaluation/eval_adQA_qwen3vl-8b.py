@@ -129,8 +129,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen3-VL-8B inference for AdsQA")
     parser.add_argument('--video_dir', type=str, default='',
                         help='Directory containing video files')
-    parser.add_argument('--file_dir', type=str, default='./adsqa_full_set',
-                        help='Directory containing question and ASR files')
+    parser.add_argument('--asr_file', type=str, default='./evaluation/asr_set.json',
+                        help='Path to ASR file (asr_set.json)')
+    parser.add_argument('--question_file', type=str, default='./testset_question.json',
+                        help='Path to question file (testset_question.json)')
     parser.add_argument('--model_dir', type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help='Model path or HuggingFace model ID')
     parser.add_argument('--model_name', type=str, default='qwen3vl-8b',
@@ -145,8 +147,8 @@ if __name__ == "__main__":
 
     # Load data
     print("Loading ASR and question data...")
-    asr_results_set = read_json(f'./{args.file_dir}/asr_set.json')
-    raw_test_data = read_json(f'./{args.file_dir}/testset_question.json')
+    asr_results_set = read_json(args.asr_file)
+    raw_test_data = read_json(args.question_file)
 
     # Limit samples for testing if specified
     if args.max_samples:
