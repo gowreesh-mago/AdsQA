@@ -1,0 +1,49 @@
+# ============================================================
+# AdsQA Evaluation Pipeline Configuration
+# ============================================================
+
+models:
+  video_inference:
+    qwen3_vl_8b:
+      model_path: "Qwen/Qwen3-VL-8B-Instruct"
+      total_pixels: 671088640  # 20480*32*32
+      min_pixels: 65536        # 64*32*32
+      max_frames: 2048
+      sample_fps: 2
+      max_new_tokens: 1524
+      temperature: 1.0
+
+    qwen2_5_vl_7b:
+      model_path: "Qwen/Qwen2.5-VL-7B-Instruct"
+      max_pixels: 604800       # 360*420*4
+      fps: 2.0
+      max_new_tokens: 1524
+      temperature: 1.0
+
+  evaluator:
+    qwen2_5_7b_instruct:
+      model_path: "Qwen/Qwen2.5-7B-Instruct"
+      max_new_tokens: 512
+      temperature: 0.1
+      do_sample: false
+
+    gpt4o:
+      model: "gpt-4o-2024-08-06"
+      max_tokens: 8000
+      temperature: 0.0
+
+data:
+  video_dir: "./videos/"
+  results_dir: "./results/"
+  asr_file: "./evaluation/asr_set.json"
+  testset_groundtruth: "./testset_groundtruth.json"
+
+error_analysis:
+  enabled: true
+  output_dir: "./error_reports/"
+  categories:
+    - "Format Error"
+    - "Complete Mismatch"
+    - "Partial Match"
+    - "Hallucination"
+    - "Missing Information"
