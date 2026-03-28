@@ -11,10 +11,10 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
-from hallucination_verifier import HallucinationVerifier
+from hallucination_verifier import HallucinationVerifier, LLMSemanticVerifier
 
 
-# Enhanced evaluation prompt with reasoning
+# Enhanced evaluation prompt with robust formatting requirements
 prompt_template = """
 You are an expert evaluator comparing a model's answer against a ground truth answer.
 
@@ -39,13 +39,17 @@ You are an expert evaluator comparing a model's answer against a ground truth an
 
 ###Output Format (EXACT format required):
 
-Answer: [0 or 0.5 or 1]
+Answer: [EXACTLY 0 or 0.5 or 1]
 
 Missing Information: [SPECIFIC_INFO_1] | [SPECIFIC_INFO_2] | ... OR None
 
 Hallucination: [SPECIFIC_CLAIM_1] | [SPECIFIC_CLAIM_2] | ... OR None
 
-IMPORTANT: Use pipe separators (|) between multiple items. Write exactly "None" if there are no issues.
+IMPORTANT:
+- For Answer, write ONLY "Answer: 0", "Answer: 0.5", or "Answer: 1" (no other text)
+- Use pipe separators (|) between multiple items
+- Write exactly "None" if there are no issues (not "none", "None.", etc.)
+- Do not add explanations or additional text after "None"
 """
 
 
@@ -108,6 +112,26 @@ def evaluate_with_qwen(model, tokenizer, question, golden_answer, response):
     generated = outputs[0][inputs["input_ids"].shape[-1]:]
     response_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
+    # Helper function to clean claims
+    def clean_claims(text):
+        """Filter 'None' variants from pipe-separated claims, handle 'OR None' malformations"""
+        if not text or text.strip().lower() in ["none", "none.", ""]:
+            return ""
+        claims = [c.strip() for c in text.split('|') if c.strip()]
+
+        # Filter explicit "None" variants
+        claims = [c for c in claims if c.lower() not in ["none", "none.", ""]]
+
+        # Handle malformed "X OR None" or "X or none" patterns
+        cleaned_claims = []
+        for claim in claims:
+            # Remove " OR None" suffix (case-insensitive)
+            claim_cleaned = re.sub(r'\s+(or|OR)\s+(none|None|NONE)\.?$', '', claim).strip()
+            if claim_cleaned and claim_cleaned.lower() not in ["none", "none.", ""]:
+                cleaned_claims.append(claim_cleaned)
+
+        return ' | '.join(cleaned_claims) if cleaned_claims else ""
+
     # Parse response
     result = {
         "score": "",
@@ -116,26 +140,25 @@ def evaluate_with_qwen(model, tokenizer, question, golden_answer, response):
         "full_response": response_text
     }
 
-    # Extract score
-    score_match = re.search(r'Answer:\s*(0\.5|0|1)', response_text)
-    if score_match:
+    # Extract score with robust parsing
+    score_match = re.search(r'Answer:\s*(0\.5|0|1)(?:\s|$)', response_text)
+    if not score_match:
+        print(f"WARNING: Could not parse score from: {response_text[:100]}")
+        result["score"] = "Answer: 0"  # Conservative default
+    else:
         result["score"] = f"Answer: {score_match.group(1)}"
 
     # Extract missing information (pipe-separated format)
     missing_match = re.search(r'Missing Information:\s*(.*?)(?=Hallucination:|$)', response_text, re.DOTALL)
     if missing_match:
         missing_text = missing_match.group(1).strip()
-        # Clean up and check for "None"
-        if missing_text and missing_text.lower() not in ["none", "none.", ""]:
-            result["missing_info"] = missing_text
+        result["missing_info"] = clean_claims(missing_text)
 
-    # Extract hallucinations (pipe-separated format, new field name)
+    # Extract hallucinations (pipe-separated format)
     halluc_match = re.search(r'Hallucination:\s*(.*?)$', response_text, re.DOTALL)
     if halluc_match:
         halluc_text = halluc_match.group(1).strip()
-        # Clean up and check for "None"
-        if halluc_text and halluc_text.lower() not in ["none", "none.", ""]:
-            result["hallucinations"] = halluc_text
+        result["hallucinations"] = clean_claims(halluc_text)
 
     return result
 
@@ -174,9 +197,9 @@ if __name__ == '__main__':
     model.eval()
     print("Model loaded successfully!")
 
-    # Initialize hallucination verifier
-    print("Initializing hallucination verifier...")
-    verifier = HallucinationVerifier(fuzzy_threshold=0.85)
+    # Initialize LLM-based semantic verifier
+    print("Initializing LLM-based semantic verifier...")
+    verifier = LLMSemanticVerifier()
     print("Verifier initialized!")
 
     # Tracking metrics
@@ -256,9 +279,7 @@ if __name__ == '__main__':
         if "<answer>" in pred_answer:
             pred_answer = re.sub(r'(?s).*<answer>\s*(.*?)\s*</answer>.*', r'\1', pred_answer)
 
-        # Truncate to 30 words
-        if len(pred_answer.split()) > 30:
-            pred_answer = ' '.join(pred_answer.split()[0:30])
+        # NO TRUNCATION - evaluate full predictions for semantic understanding
 
         # Evaluate with Qwen2.5-7B (without meta_info)
         try:
@@ -267,16 +288,20 @@ if __name__ == '__main__':
                 question, gt_answer, pred_answer
             )
 
-            # VERIFICATION STEP 1: Verify hallucinations
-            halluc_verification = verifier.verify_hallucinations(
+            # VERIFICATION STEP 1: Verify hallucinations using LLM
+            halluc_verification = verifier.verify_hallucinations_llm(
                 eval_result['hallucinations'],
-                gt_answer
+                gt_answer,
+                model,
+                tokenizer
             )
 
-            # VERIFICATION STEP 2: Verify missing information
-            missing_verification = verifier.verify_missing_info(
+            # VERIFICATION STEP 2: Verify missing information using LLM
+            missing_verification = verifier.verify_missing_info_llm(
                 eval_result['missing_info'],
-                gt_answer
+                gt_answer,
+                model,
+                tokenizer
             )
 
             # Only keep verified hallucinations
@@ -289,10 +314,12 @@ if __name__ == '__main__':
                 missing_verification['verified_missing']
             ) if missing_verification['verified_missing'] else ''
 
-            # VERIFICATION STEP 3: Verify partial match scoring (0.5)
+            # VERIFICATION STEP 3: Verify partial match scoring (0.5) using LLM
             if '0.5' in eval_result['score']:
-                # Verify that SOME ground truth is present
-                overlap_check = verifier.verify_partial_match(pred_answer, gt_answer, min_overlap=0.2)
+                # Use LLM to verify semantic overlap
+                overlap_check = verifier.verify_partial_match_llm(
+                    pred_answer, gt_answer, model, tokenizer
+                )
 
                 # Verify NO hallucinations
                 has_hallucinations = len(halluc_verification['verified_hallucinations']) > 0
@@ -302,9 +329,9 @@ if __name__ == '__main__':
                     eval_result['score'] = 'Answer: 0'
                     print(f"  WARNING: Corrected invalid 0.5 score to 0 for {question_id}")
                     if not overlap_check:
-                        print(f"    Reason: No ground truth overlap detected")
+                        print(f"    Reason: No semantic overlap detected by LLM")
                     if has_hallucinations:
-                        print(f"    Reason: Contains hallucinations")
+                        print(f"    Reason: Contains verified hallucinations")
 
             # Save verification details
             eval_result['hallucination_verification'] = halluc_verification

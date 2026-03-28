@@ -42,6 +42,6 @@ error_analysis:
   enabled: true
   output_dir: "./error_reports/"
   categories:
-    - "Partial Match"
     - "Hallucination"
     - "Missing Information"
+    - "Partial Match"

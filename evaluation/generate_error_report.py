@@ -59,16 +59,16 @@ def generate_comprehensive_report(
         groundtruth = groundtruth[:max_samples]
         print(f"Testing mode: Analyzing only {max_samples} samples")
 
-    # Initialize report structure
+    # Initialize report structure (3 error types only)
     report = {
         "model": eval_name,
         "total_questions": len(groundtruth),
         "evaluated_questions": 0,
         "perfect_scores": 0,
         "error_summary": {
-            "Partial Match": 0,
             "Hallucination": 0,
-            "Missing Information": 0
+            "Missing Information": 0,
+            "Partial Match": 0
         },
         "score_distribution": {
             "score_0": 0,
@@ -223,7 +223,7 @@ def generate_comprehensive_report(
     print(f"  Primary Issue: {report['overall_insights']['primary_issue']}")
     print(f"  Hallucination Rate: {report['overall_insights']['hallucination_prevalence']:.1f}% of errors")
     print(f"  Missing Information Rate: {report['overall_insights']['missing_information_prevalence']:.1f}% of errors")
-    print(f"  Format Error Rate: {report['overall_insights']['format_error_rate']:.1f}% of evaluated questions")
+    print(f"  Partial Match Rate: {report['overall_insights']['partial_match_prevalence']:.1f}% of errors")
 
     print("\n" + "="*70)
     print(f"Report saved to: {output_path}")
