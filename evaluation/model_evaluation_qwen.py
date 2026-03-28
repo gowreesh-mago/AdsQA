@@ -11,40 +11,41 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from hallucination_verifier import HallucinationVerifier
 
 
 # Enhanced evaluation prompt with reasoning
 prompt_template = """
-You are an advertising expert specializing in evaluating whether a respondent's answer after watching a video matches the golden answer. We will provide the video's Meta-Information, Question, Golden Answer, and the Response to be judged below.
-
-###The meta-information includes the advertisement video's theme, creative points, and a brief content description, which can be regarded as ground-truth information, as follows::
-{meta_info}
+You are an expert evaluator comparing a model's answer against a ground truth answer.
 
 ###Question:
 {question}
 
-###Golden Answer:
+###Ground Truth Answer:
 {golden_answer}
 
-###Rule:
-1. If the response to be judged contains ALL key information of the golden answer or expresses the same meaning using other sentences or synonyms, it is considered a match with the golden answer, and the output is 1.
-2. If the response to be judged does NOT contain the key information from the golden answer, it is considered a mismatch, and the output is 0.
-3. The response to be judged should NOT contain any content that is contradictory, conflicting, or unreasonable when inferred from the meta-information. If such content exist, it is considered a mismatch, and the output is 0.
-4. If the response to be judged contains the MOST of key information of the golden answer and, do NOT contain any information that is contradictory, conflicting, or unreasonable when inferred from the meta-information, it is considered a partial match, and the output is 0.5.
-
-###Response to be judged:
+###Response to Evaluate:
 {response}
 
-###Instructions:
-Provide your evaluation in the following format:
+###Evaluation Rules:
+1. Compare ONLY the Response against the Ground Truth Answer
+2. Check if Response contains ALL key information from Ground Truth
+3. Check if Response contains ANY claims NOT present in Ground Truth
+
+###Scoring:
+- 1: Response contains ALL key information and NO hallucinations
+- 0.5: Response contains SOME key information, NO hallucinations, but missing other key info
+- 0: Response is incorrect (missing most/all key info OR contains hallucinations)
+
+###Output Format (EXACT format required):
 
 Answer: [0 or 0.5 or 1]
 
-Missing Information:
-[List specific key information from the golden answer that is MISSING or INCOMPLETE in the response. If nothing is missing, write "None"]
+Missing Information: [SPECIFIC_INFO_1] | [SPECIFIC_INFO_2] | ... OR None
 
-Hallucinations/Errors:
-[List specific claims in the response that CONTRADICT the meta-information or golden answer. If no contradictions, write "None"]
+Hallucination: [SPECIFIC_CLAIM_1] | [SPECIFIC_CLAIM_2] | ... OR None
+
+IMPORTANT: Use pipe separators (|) between multiple items. Write exactly "None" if there are no issues.
 """
 
 
@@ -55,14 +56,13 @@ def read_json(jpath):
     return data
 
 
-def evaluate_with_qwen(model, tokenizer, meta_info, question, golden_answer, response):
+def evaluate_with_qwen(model, tokenizer, question, golden_answer, response):
     """
     Evaluate response using Qwen2.5-7B-Instruct
 
     Args:
         model: Qwen2.5-7B-Instruct model
         tokenizer: Corresponding tokenizer
-        meta_info: Advertisement meta-information
         question: Question text
         golden_answer: Ground truth answer
         response: Model's answer to evaluate
@@ -70,13 +70,12 @@ def evaluate_with_qwen(model, tokenizer, meta_info, question, golden_answer, res
     Returns:
         Dictionary with:
         - score: Score string in format "Answer: X" where X is 0, 0.5, or 1
-        - missing_info: String describing missing information
-        - hallucinations: String describing hallucinations/errors
+        - missing_info: String describing missing information (pipe-separated)
+        - hallucinations: String describing hallucinations (pipe-separated)
         - full_response: Complete model response
     """
-    # Format prompt
+    # Format prompt (without meta_info)
     prompt = prompt_template.format(
-        meta_info=meta_info,
         question=question,
         golden_answer=golden_answer,
         response=response
@@ -122,18 +121,20 @@ def evaluate_with_qwen(model, tokenizer, meta_info, question, golden_answer, res
     if score_match:
         result["score"] = f"Answer: {score_match.group(1)}"
 
-    # Extract missing information
-    missing_match = re.search(r'Missing Information:\s*(.*?)(?=Hallucinations/Errors:|$)', response_text, re.DOTALL)
+    # Extract missing information (pipe-separated format)
+    missing_match = re.search(r'Missing Information:\s*(.*?)(?=Hallucination:|$)', response_text, re.DOTALL)
     if missing_match:
         missing_text = missing_match.group(1).strip()
-        if missing_text.lower() not in ["none", "none.", ""]:
+        # Clean up and check for "None"
+        if missing_text and missing_text.lower() not in ["none", "none.", ""]:
             result["missing_info"] = missing_text
 
-    # Extract hallucinations
-    halluc_match = re.search(r'Hallucinations/Errors:\s*(.*?)$', response_text, re.DOTALL)
+    # Extract hallucinations (pipe-separated format, new field name)
+    halluc_match = re.search(r'Hallucination:\s*(.*?)$', response_text, re.DOTALL)
     if halluc_match:
         halluc_text = halluc_match.group(1).strip()
-        if halluc_text.lower() not in ["none", "none.", ""]:
+        # Clean up and check for "None"
+        if halluc_text and halluc_text.lower() not in ["none", "none.", ""]:
             result["hallucinations"] = halluc_text
 
     return result
@@ -172,6 +173,11 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     model.eval()
     print("Model loaded successfully!")
+
+    # Initialize hallucination verifier
+    print("Initializing hallucination verifier...")
+    verifier = HallucinationVerifier(fuzzy_threshold=0.85)
+    print("Verifier initialized!")
 
     # Tracking metrics
     strict_acc_scores = {"Type_1": 0, "Type_2": 0, "Type_3": 0, "Type_4": 0, "Type_5": 0}
@@ -254,12 +260,56 @@ if __name__ == '__main__':
         if len(pred_answer.split()) > 30:
             pred_answer = ' '.join(pred_answer.split()[0:30])
 
-        # Evaluate with Qwen2.5-7B
+        # Evaluate with Qwen2.5-7B (without meta_info)
         try:
             eval_result = evaluate_with_qwen(
                 model, tokenizer,
-                meta_info, question, gt_answer, pred_answer
+                question, gt_answer, pred_answer
             )
+
+            # VERIFICATION STEP 1: Verify hallucinations
+            halluc_verification = verifier.verify_hallucinations(
+                eval_result['hallucinations'],
+                gt_answer
+            )
+
+            # VERIFICATION STEP 2: Verify missing information
+            missing_verification = verifier.verify_missing_info(
+                eval_result['missing_info'],
+                gt_answer
+            )
+
+            # Only keep verified hallucinations
+            eval_result['hallucinations'] = ' | '.join(
+                halluc_verification['verified_hallucinations']
+            ) if halluc_verification['verified_hallucinations'] else ''
+
+            # Only keep verified missing info
+            eval_result['missing_info'] = ' | '.join(
+                missing_verification['verified_missing']
+            ) if missing_verification['verified_missing'] else ''
+
+            # VERIFICATION STEP 3: Verify partial match scoring (0.5)
+            if '0.5' in eval_result['score']:
+                # Verify that SOME ground truth is present
+                overlap_check = verifier.verify_partial_match(pred_answer, gt_answer, min_overlap=0.2)
+
+                # Verify NO hallucinations
+                has_hallucinations = len(halluc_verification['verified_hallucinations']) > 0
+
+                if not overlap_check or has_hallucinations:
+                    # Invalid 0.5 score - downgrade to 0
+                    eval_result['score'] = 'Answer: 0'
+                    print(f"  WARNING: Corrected invalid 0.5 score to 0 for {question_id}")
+                    if not overlap_check:
+                        print(f"    Reason: No ground truth overlap detected")
+                    if has_hallucinations:
+                        print(f"    Reason: Contains hallucinations")
+
+            # Save verification details
+            eval_result['hallucination_verification'] = halluc_verification
+            eval_result['missing_info_verification'] = missing_verification
+
         except Exception as e:
             print(f"\nError during evaluation of {question_id}: {e}")
             continue
@@ -269,6 +319,8 @@ if __name__ == '__main__':
         pred_item[0]['missing_info'] = eval_result['missing_info']
         pred_item[0]['hallucinations'] = eval_result['hallucinations']
         pred_item[0]['evaluation_reasoning'] = eval_result['full_response']
+        pred_item[0]['hallucination_verification'] = eval_result.get('hallucination_verification', {})
+        pred_item[0]['missing_info_verification'] = eval_result.get('missing_info_verification', {})
 
         with open(pred_path, 'w', encoding='utf-8') as ff:
             json.dump(pred_item, ff, indent=4, ensure_ascii=False)

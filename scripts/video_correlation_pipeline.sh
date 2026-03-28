@@ -124,9 +124,9 @@ echo "--------------------------------------------------------"
 python evaluation/correlation_analysis.py \
   --video-stats "$VIDEO_STATS_OUTPUT" \
   --error-report "$ERROR_REPORT" \
+  --groundtruth-file "$GROUNDTRUTH_FILE" \
   --output-json "$CORRELATION_OUTPUT" \
-  --output-plots-dir "$PLOTS_DIR" \
-  --top-n 15
+  --output-plots-dir "$PLOTS_DIR"
 
 echo ""
 echo "✓ Correlation analysis complete!"

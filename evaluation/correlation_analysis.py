@@ -1,19 +1,49 @@
 """
-Correlation Analysis for Video Statistics vs. Model Errors
-Analyzes correlations between video characteristics and model error patterns,
-generating both JSON reports and visualizations.
+Error Analysis for Video Statistics vs. Model Errors
+Analyzes how video characteristics relate to different error types.
+Shows clear, interpretable comparisons (e.g., "1-minute videos have more hallucinations than 30-second videos").
 """
 
 import argparse
 import json
 import os
+import warnings
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
+
+# Suppress warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+
+def convert_to_native_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization
+
+    Args:
+        obj: Object to convert (can be dict, list, numpy type, etc.)
+
+    Returns:
+        Object with all numpy types converted to Python native types
+    """
+    if isinstance(obj, dict):
+        return {k: convert_to_native_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_native_types(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
 
 
 def read_json(jpath):
@@ -23,13 +53,14 @@ def read_json(jpath):
     return data
 
 
-def merge_data(video_stats_path, error_report_path):
+def merge_data(video_stats_path, error_report_path, groundtruth_path=None):
     """
     Merge video statistics with error report data
 
     Args:
         video_stats_path: Path to video statistics JSON
         error_report_path: Path to error report JSON
+        groundtruth_path: Optional path to groundtruth JSON (to include perfect score questions)
 
     Returns:
         tuple: (question_df, video_df, merged_df)
@@ -77,10 +108,10 @@ def merge_data(video_stats_path, error_report_path):
 
         # Parse error types
         errors = error_entry.get('errors', [])
+
+        # Count error types (verification already done in evaluation step)
         has_hallucination = any(e['category'] == 'Hallucination' for e in errors)
         has_missing_info = any(e['category'] == 'Missing Information' for e in errors)
-        has_format_error = any(e['category'] == 'Format Error' for e in errors)
-        is_complete_mismatch = any(e['category'] == 'Complete Mismatch' for e in errors)
         is_partial_match = any(e['category'] == 'Partial Match' for e in errors)
 
         # Get question types
@@ -93,21 +124,51 @@ def merge_data(video_stats_path, error_report_path):
             'score': error_entry['score'],
             'has_hallucination': has_hallucination,
             'has_missing_info': has_missing_info,
-            'has_format_error': has_format_error,
-            'is_complete_mismatch': is_complete_mismatch,
             'is_partial_match': is_partial_match,
             'question_type': primary_question_type
         })
 
-    # Also add perfect scores from the main report
-    total_questions = error_report['total_questions']
-    evaluated_questions = error_report['evaluated_questions']
-    perfect_scores = error_report['perfect_scores']
-
     question_df = pd.DataFrame(question_records)
 
     print(f"  Loaded {len(video_df)} video statistics")
-    print(f"  Loaded {len(question_df)} question error records")
+    print(f"  Loaded {len(question_df)} question error records from detailed_errors")
+
+    # Add perfect score questions if groundtruth is provided
+    if groundtruth_path:
+        print(f"  Loading groundtruth to identify perfect score questions...")
+        groundtruth = read_json(groundtruth_path)
+
+        # Get all question IDs from groundtruth
+        all_question_ids = set(item['question_id'] for item in groundtruth)
+        error_question_ids = set(q['question_id'] for q in question_records)
+
+        # Perfect score questions = all questions - error questions
+        perfect_question_ids = all_question_ids - error_question_ids
+
+        print(f"  Found {len(perfect_question_ids)} perfect score questions")
+
+        # Add perfect score questions
+        perfect_records = []
+        for item in groundtruth:
+            if item['question_id'] in perfect_question_ids:
+                video_id = item['question_id'].rsplit('_', 1)[0]
+
+                question_types = item.get('question_type', [])
+                primary_question_type = question_types[0] if question_types else 'Unknown'
+
+                perfect_records.append({
+                    'question_id': item['question_id'],
+                    'video_id': video_id,
+                    'score': 1.0,
+                    'has_hallucination': False,
+                    'has_missing_info': False,
+                    'is_partial_match': False,
+                    'question_type': primary_question_type
+                })
+
+        # Combine with error questions
+        question_df = pd.DataFrame(question_records + perfect_records)
+        print(f"  Total questions after adding perfect scores: {len(question_df)}")
 
     # Merge on video_id
     merged_df = pd.merge(question_df, video_df, on='video_id', how='left')
@@ -121,421 +182,503 @@ def merge_data(video_stats_path, error_report_path):
     return question_df, video_df, merged_df
 
 
-def aggregate_to_video_level(merged_df):
+def analyze_error_rates_by_video_features(merged_df):
     """
-    Aggregate question-level data to video level
+    Analyze error rates binned by video characteristics
+    Shows clear comparisons like "1-minute videos have X% hallucinations vs Y% for 30-second videos"
 
     Args:
-        merged_df: Merged DataFrame with questions and video stats
+        merged_df: Merged DataFrame
 
     Returns:
-        DataFrame: Video-level aggregated data
+        dict: Analysis results with error rates per feature bin
     """
-    # Video features (take first value since they're the same for all questions from same video)
-    video_feature_cols = [
-        'duration_seconds', 'total_frames', 'fps', 'resolution_width',
-        'resolution_height', 'resolution_area', 'file_size_mb',
-        'frame_variance', 'brightness_mean', 'brightness_std',
-        'brightness_min', 'brightness_max', 'motion_intensity',
-        'color_diversity', 'scene_complexity'
-    ]
+    print("\nAnalyzing error rates by video features...")
 
-    # Aggregate error metrics
-    video_agg = merged_df.groupby('video_id').agg({
-        'score': ['mean', 'std', 'count'],
-        'has_hallucination': 'mean',  # Hallucination rate
-        'has_missing_info': 'mean',   # Missing info rate
-        'has_format_error': 'mean',   # Format error rate
-        'is_complete_mismatch': 'mean',  # Complete mismatch rate
-        'is_partial_match': 'mean',   # Partial match rate
-        **{col: 'first' for col in video_feature_cols}  # Take first value
-    })
+    results = {}
 
-    # Flatten column names
-    video_agg.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col
-                         for col in video_agg.columns]
+    # Define features to analyze and their bin labels
+    features_config = {
+        'duration_seconds': {
+            'bins': [0, 15, 30, 45, 60, float('inf')],
+            'labels': ['0-15s', '15-30s', '30-45s', '45-60s', '>60s']
+        },
+        'frame_variance': {
+            'bins': 4,  # Quartiles
+            'labels': ['Low', 'Medium-Low', 'Medium-High', 'High']
+        },
+        'motion_intensity': {
+            'bins': 4,
+            'labels': ['Low', 'Medium-Low', 'Medium-High', 'High']
+        },
+        'scene_complexity': {
+            'bins': 4,
+            'labels': ['Low', 'Medium-Low', 'Medium-High', 'High']
+        },
+        'brightness_mean': {
+            'bins': 4,
+            'labels': ['Low', 'Medium-Low', 'Medium-High', 'High']
+        }
+    }
 
-    video_agg = video_agg.reset_index()
+    error_types = {
+        'hallucination': 'has_hallucination',
+        'missing_info': 'has_missing_info',
+        'partial_match': 'is_partial_match'
+    }
 
-    return video_agg
+    for feature, config in features_config.items():
+        if feature not in merged_df.columns:
+            continue
 
+        # Create bins
+        if isinstance(config['bins'], list):
+            merged_df[f'{feature}_bin'] = pd.cut(
+                merged_df[feature],
+                bins=config['bins'],
+                labels=config['labels'],
+                include_lowest=True
+            )
+        else:
+            merged_df[f'{feature}_bin'] = pd.qcut(
+                merged_df[feature],
+                q=config['bins'],
+                labels=config['labels'],
+                duplicates='drop'
+            )
 
-def compute_correlations(video_agg_df, min_p_value=0.05):
-    """
-    Compute correlations between video features and error metrics
+        feature_results = {}
 
-    Args:
-        video_agg_df: Video-level aggregated DataFrame
-        min_p_value: Significance threshold
+        # For each bin, calculate error rates
+        for bin_label in merged_df[f'{feature}_bin'].dropna().unique():
+            bin_data = merged_df[merged_df[f'{feature}_bin'] == bin_label]
 
-    Returns:
-        dict: Correlation results
-    """
-    print("\nComputing correlations...")
-
-    # Define feature and target columns
-    video_features = [
-        'duration_seconds', 'total_frames', 'fps', 'resolution_area',
-        'file_size_mb', 'frame_variance', 'brightness_mean',
-        'brightness_std', 'motion_intensity', 'color_diversity',
-        'scene_complexity'
-    ]
-
-    error_metrics = [
-        'score_mean', 'has_hallucination', 'has_missing_info',
-        'has_format_error', 'is_complete_mismatch', 'is_partial_match'
-    ]
-
-    correlation_results = {}
-
-    for feature in video_features:
-        for metric in error_metrics:
-            # Skip if either column has all NaN
-            if video_agg_df[feature].isna().all() or video_agg_df[metric].isna().all():
-                continue
-
-            # Drop NaN values for this pair
-            valid_data = video_agg_df[[feature, metric]].dropna()
-
-            if len(valid_data) < 3:  # Need at least 3 points
-                continue
-
-            x = valid_data[feature].values
-            y = valid_data[metric].values
-
-            # Pearson correlation (linear)
-            pearson_r, pearson_p = stats.pearsonr(x, y)
-
-            # Spearman correlation (monotonic, robust)
-            spearman_r, spearman_p = stats.spearmanr(x, y)
-
-            correlation_results[f"{feature}_vs_{metric}"] = {
-                'feature': feature,
-                'target': metric,
-                'pearson_r': float(pearson_r),
-                'pearson_p': float(pearson_p),
-                'spearman_r': float(spearman_r),
-                'spearman_p': float(spearman_p),
-                'significant': pearson_p < min_p_value,
-                'sample_size': len(valid_data)
+            bin_stats = {
+                'count': len(bin_data),
+                'mean_score': float(bin_data['score'].mean()),
+                'error_rates': {}
             }
 
-    print(f"  Computed {len(correlation_results)} correlation pairs")
+            # Calculate error rates for each error type
+            for error_name, error_col in error_types.items():
+                if error_col in bin_data.columns:
+                    error_rate = (bin_data[error_col].sum() / len(bin_data) * 100) if len(bin_data) > 0 else 0
+                    bin_stats['error_rates'][error_name] = float(error_rate)
 
-    # Identify significant correlations
-    significant = {k: v for k, v in correlation_results.items() if v['significant']}
-    print(f"  Found {len(significant)} significant correlations (p < {min_p_value})")
+            # Add feature value range for this bin
+            bin_stats['feature_range'] = {
+                'min': float(bin_data[feature].min()),
+                'max': float(bin_data[feature].max()),
+                'mean': float(bin_data[feature].mean())
+            }
 
-    return correlation_results
+            feature_results[str(bin_label)] = bin_stats
+
+        results[feature] = feature_results
+
+    return results
 
 
-def compute_per_question_type_correlations(merged_df, min_p_value=0.05):
+def plot_error_rates_by_features(merged_df, output_dir):
     """
-    Compute correlations per question type
+    Plot error rates by video feature bins
+    Shows how different video characteristics affect error rates
 
     Args:
         merged_df: Merged DataFrame
-        min_p_value: Significance threshold
-
-    Returns:
-        dict: Per-question-type correlation results
+        output_dir: Output directory
     """
-    print("\nComputing per-question-type correlations...")
+    print("\nGenerating error rate comparison plots...")
 
-    question_types = merged_df['question_type'].unique()
-    per_type_results = {}
+    # Check if we have any perfect score questions
+    total_questions = len(merged_df)
+    perfect_questions = (merged_df['score'] == 1.0).sum()
+    error_questions = (merged_df['score'] < 1.0).sum()
 
-    for qtype in question_types:
-        if qtype == 'Unknown':
+    print(f"  Dataset composition: {total_questions} total, {perfect_questions} perfect (score=1.0), {error_questions} with errors")
+
+    if perfect_questions == 0:
+        print(f"  WARNING: No perfect score questions in dataset!")
+        print(f"  This means error rates will be 100% for common error types.")
+        print(f"  The 'scores by features' plot will be more informative.")
+
+    error_types = {
+        'Hallucination': 'has_hallucination',
+        'Missing Info': 'has_missing_info',
+        'Partial Match': 'is_partial_match'
+    }
+
+    features_config = {
+        'duration_seconds': {
+            'bins': [0, 15, 30, 45, 60, float('inf')],
+            'labels': ['0-15s', '15-30s', '30-45s', '45-60s', '>60s'],
+            'title': 'Video Duration'
+        },
+        'frame_variance': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Frame Variance (Visual Diversity)'
+        },
+        'motion_intensity': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Motion Intensity'
+        },
+        'scene_complexity': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Scene Complexity'
+        }
+    }
+
+    for feature, config in features_config.items():
+        if feature not in merged_df.columns:
             continue
 
-        type_df = merged_df[merged_df['question_type'] == qtype]
+        # Create bins
+        if isinstance(config['bins'], list):
+            merged_df[f'{feature}_bin'] = pd.cut(
+                merged_df[feature],
+                bins=config['bins'],
+                labels=config['labels'],
+                include_lowest=True
+            )
+        else:
+            merged_df[f'{feature}_bin'] = pd.qcut(
+                merged_df[feature],
+                q=config['bins'],
+                labels=config['labels'],
+                duplicates='drop'
+            )
 
-        if len(type_df) < 10:  # Skip if too few samples
-            continue
+        # Calculate error rates for each bin
+        fig, ax = plt.subplots(figsize=(14, 7))
 
-        # Aggregate to video level for this type
-        type_agg = aggregate_to_video_level(type_df)
+        # Sort bin labels in logical order
+        if feature == 'duration_seconds':
+            bin_order = ['0-15s', '15-30s', '30-45s', '45-60s', '>60s']
+            bin_labels = [b for b in bin_order if b in merged_df[f'{feature}_bin'].dropna().unique()]
+        else:
+            bin_labels = ['Low', 'Med-Low', 'Med-High', 'High']
+            bin_labels = [b for b in bin_labels if b in merged_df[f'{feature}_bin'].dropna().unique()]
 
-        # Compute correlations
-        type_corr = compute_correlations(type_agg, min_p_value)
+        x = np.arange(len(bin_labels))
+        width = 0.15
 
-        per_type_results[qtype] = type_corr
+        for i, (error_name, error_col) in enumerate(error_types.items()):
+            if error_col not in merged_df.columns:
+                continue
 
-        significant_count = sum(1 for v in type_corr.values() if v['significant'])
-        print(f"  {qtype}: {significant_count} significant correlations ({len(type_df)} questions)")
+            error_rates = []
+            counts = []
+            for bin_label in bin_labels:
+                bin_data = merged_df[merged_df[f'{feature}_bin'] == bin_label]
+                if len(bin_data) > 0:
+                    # Calculate as percentage of ALL questions in this bin
+                    error_count = bin_data[error_col].sum()
+                    error_rate = (error_count / len(bin_data) * 100)
+                    error_rates.append(error_rate)
+                    counts.append(f"n={len(bin_data)}")
+                else:
+                    error_rates.append(0)
+                    counts.append("n=0")
 
-    return per_type_results
+            offset = width * (i - len(error_types)/2)
+            bars = ax.bar(x + offset, error_rates, width, label=error_name, alpha=0.8)
 
+            # Add value labels on bars (only if > 5%)
+            for j, bar in enumerate(bars):
+                height = bar.get_height()
+                if height > 5:
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.1f}%',
+                           ha='center', va='bottom', fontsize=8)
 
-def identify_top_correlations(correlation_results, top_n=10):
-    """
-    Identify top N correlations by absolute correlation value
+        # Add sample sizes below x-axis
+        for i, bin_label in enumerate(bin_labels):
+            bin_data = merged_df[merged_df[f'{feature}_bin'] == bin_label]
+            ax.text(i, -5, f'n={len(bin_data)}', ha='center', fontsize=9, color='gray')
 
-    Args:
-        correlation_results: Dictionary of correlation results
-        top_n: Number of top correlations to return
-
-    Returns:
-        list: Top N correlations sorted by |r|
-    """
-    # Sort by absolute Pearson correlation
-    sorted_corr = sorted(
-        correlation_results.items(),
-        key=lambda x: abs(x[1]['pearson_r']),
-        reverse=True
-    )
-
-    top_correlations = []
-    for key, corr in sorted_corr[:top_n]:
-        # Generate interpretation
-        direction = "positively" if corr['pearson_r'] > 0 else "negatively"
-        strength = "strongly" if abs(corr['pearson_r']) > 0.5 else "moderately" if abs(corr['pearson_r']) > 0.3 else "weakly"
-
-        interpretation = f"{corr['feature']} correlates {strength} {direction} with {corr['target']} (r={corr['pearson_r']:.3f}, p={corr['pearson_p']:.4f})"
-
-        top_correlations.append({
-            'feature': corr['feature'],
-            'target': corr['target'],
-            'pearson_r': corr['pearson_r'],
-            'spearman_r': corr['spearman_r'],
-            'p_value': corr['pearson_p'],
-            'significant': corr['significant'],
-            'interpretation': interpretation
-        })
-
-    return top_correlations
-
-
-def plot_correlation_heatmap(correlation_results, output_path):
-    """
-    Generate correlation heatmap
-
-    Args:
-        correlation_results: Dictionary of correlation results
-        output_path: Output file path
-    """
-    # Extract unique features and metrics
-    features = sorted(set(v['feature'] for v in correlation_results.values()))
-    metrics = sorted(set(v['target'] for v in correlation_results.values()))
-
-    # Create correlation matrix
-    corr_matrix = np.zeros((len(features), len(metrics)))
-    p_matrix = np.ones((len(features), len(metrics)))
-
-    for i, feature in enumerate(features):
-        for j, metric in enumerate(metrics):
-            key = f"{feature}_vs_{metric}"
-            if key in correlation_results:
-                corr_matrix[i, j] = correlation_results[key]['pearson_r']
-                p_matrix[i, j] = correlation_results[key]['pearson_p']
-
-    # Create figure
-    plt.figure(figsize=(12, 10))
-
-    # Plot heatmap
-    sns.heatmap(
-        corr_matrix,
-        xticklabels=metrics,
-        yticklabels=features,
-        annot=True,
-        fmt='.2f',
-        cmap='RdBu_r',
-        center=0,
-        vmin=-1,
-        vmax=1,
-        cbar_kws={'label': 'Pearson Correlation'}
-    )
-
-    plt.title('Correlation Heatmap: Video Features vs. Error Metrics', fontsize=14, pad=20)
-    plt.xlabel('Error Metrics', fontsize=12)
-    plt.ylabel('Video Features', fontsize=12)
-    plt.tight_layout()
-
-    # Save
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"  Saved correlation heatmap to: {output_path}")
-
-
-def plot_top_correlations(merged_df, top_correlations, output_path, top_n=10):
-    """
-    Create scatter plot grid for top N correlations
-
-    Args:
-        merged_df: Merged DataFrame
-        top_correlations: List of top correlations
-        output_path: Output file path
-        top_n: Number of correlations to plot
-    """
-    # Aggregate to video level
-    video_agg = aggregate_to_video_level(merged_df)
-
-    # Determine grid size
-    n_plots = min(len(top_correlations), top_n)
-    n_cols = min(3, n_plots)
-    n_rows = (n_plots + n_cols - 1) // n_cols
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
-    axes = axes.flatten() if n_plots > 1 else [axes]
-
-    for idx, corr in enumerate(top_correlations[:top_n]):
-        ax = axes[idx]
-
-        feature = corr['feature']
-        target = corr['target']
-
-        # Get data
-        valid_data = video_agg[[feature, target]].dropna()
-        x = valid_data[feature].values
-        y = valid_data[target].values
-
-        # Scatter plot
-        ax.scatter(x, y, alpha=0.5, s=30)
-
-        # Add regression line
-        z = np.polyfit(x, y, 1)
-        p = np.poly1d(z)
-        x_line = np.linspace(x.min(), x.max(), 100)
-        ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2)
-
-        # Labels
-        ax.set_xlabel(feature.replace('_', ' ').title(), fontsize=10)
-        ax.set_ylabel(target.replace('_', ' ').title(), fontsize=10)
-        ax.set_title(f"r={corr['pearson_r']:.3f}, p={corr['p_value']:.4f}", fontsize=11)
-        ax.grid(True, alpha=0.3)
-
-    # Remove extra subplots
-    for idx in range(n_plots, len(axes)):
-        fig.delaxes(axes[idx])
-
-    plt.suptitle(f'Top {n_plots} Correlations', fontsize=16, y=1.00)
-    plt.tight_layout()
-
-    # Save
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"  Saved top correlations plot to: {output_path}")
-
-
-def plot_score_distributions(merged_df, output_dir):
-    """
-    Plot score distributions across feature bins
-
-    Args:
-        merged_df: Merged DataFrame
-        output_dir: Output directory for plots
-    """
-    features_to_plot = ['duration_seconds', 'frame_variance', 'motion_intensity', 'scene_complexity']
-
-    for feature in features_to_plot:
-        # Create quartile bins
-        merged_df[f'{feature}_bin'] = pd.qcut(
-            merged_df[feature],
-            q=4,
-            labels=['Q1 (Low)', 'Q2', 'Q3', 'Q4 (High)'],
-            duplicates='drop'
-        )
-
-        # Box plot
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(data=merged_df, x=f'{feature}_bin', y='score', palette='Set2')
-        plt.title(f'Score Distribution by {feature.replace("_", " ").title()}', fontsize=14)
-        plt.xlabel(f'{feature.replace("_", " ").title()} Quartile', fontsize=12)
-        plt.ylabel('Score', fontsize=12)
-        plt.grid(True, alpha=0.3, axis='y')
+        ax.set_xlabel(config['title'], fontsize=13)
+        ax.set_ylabel('Error Rate (% of all questions in bin)', fontsize=13)
+        ax.set_title(f'Error Rates by {config["title"]}\n(% of questions with each error type)', fontsize=15)
+        ax.set_xticks(x)
+        ax.set_xticklabels(bin_labels)
+        ax.legend(loc='upper left', fontsize=10)
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.set_ylim(0, 105)  # Give space for labels
         plt.tight_layout()
 
-        # Save
-        output_path = os.path.join(output_dir, f'score_distribution_by_{feature}.png')
+        output_path = os.path.join(output_dir, f'error_rates_by_{feature}.png')
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
+        print(f"  Saved error rates by {feature} plot")
 
-        print(f"  Saved {feature} distribution plot to: {output_path}")
 
-
-def plot_feature_distributions(merged_df, output_path):
+def plot_score_by_features(merged_df, output_dir):
     """
-    Compare feature distributions for error vs. non-error cases
+    Plot average score by video feature bins
 
     Args:
         merged_df: Merged DataFrame
-        output_path: Output file path
+        output_dir: Output directory
     """
-    features = ['duration_seconds', 'frame_variance', 'motion_intensity', 'brightness_mean']
+    print("\nGenerating score comparison plots...")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    features_config = {
+        'duration_seconds': {
+            'bins': [0, 15, 30, 45, 60, float('inf')],
+            'labels': ['0-15s', '15-30s', '30-45s', '45-60s', '>60s'],
+            'title': 'Video Duration'
+        },
+        'frame_variance': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Frame Variance'
+        },
+        'motion_intensity': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Motion Intensity'
+        },
+        'scene_complexity': {
+            'bins': 4,
+            'labels': ['Low', 'Med-Low', 'Med-High', 'High'],
+            'title': 'Scene Complexity'
+        }
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     axes = axes.flatten()
 
-    for idx, feature in enumerate(features):
+    for idx, (feature, config) in enumerate(features_config.items()):
+        if feature not in merged_df.columns or idx >= len(axes):
+            continue
+
         ax = axes[idx]
 
-        # Split by score
-        error_data = merged_df[merged_df['score'] < 1][feature]
-        perfect_data = merged_df[merged_df['score'] == 1][feature]
+        # Create bins
+        if isinstance(config['bins'], list):
+            merged_df[f'{feature}_bin'] = pd.cut(
+                merged_df[feature],
+                bins=config['bins'],
+                labels=config['labels'],
+                include_lowest=True
+            )
+        else:
+            merged_df[f'{feature}_bin'] = pd.qcut(
+                merged_df[feature],
+                q=config['bins'],
+                labels=config['labels'],
+                duplicates='drop'
+            )
 
-        # Histogram
-        ax.hist(error_data, bins=30, alpha=0.6, label='Error (score < 1)', color='red', density=True)
-        ax.hist(perfect_data, bins=30, alpha=0.6, label='Perfect (score = 1)', color='green', density=True)
+        # Calculate mean scores and counts
+        bin_labels = merged_df[f'{feature}_bin'].dropna().unique()
+        mean_scores = []
+        counts = []
 
-        ax.set_xlabel(feature.replace('_', ' ').title(), fontsize=11)
-        ax.set_ylabel('Density', fontsize=11)
-        ax.set_title(f'{feature.replace("_", " ").title()} Distribution', fontsize=12)
+        for bin_label in bin_labels:
+            bin_data = merged_df[merged_df[f'{feature}_bin'] == bin_label]
+            mean_scores.append(bin_data['score'].mean())
+            counts.append(len(bin_data))
+
+        # Bar plot
+        bars = ax.bar(range(len(bin_labels)), mean_scores, alpha=0.7, edgecolor='black')
+
+        # Color bars by score
+        for bar, score in zip(bars, mean_scores):
+            if score >= 0.8:
+                bar.set_color('#2ca02c')  # Green
+            elif score >= 0.5:
+                bar.set_color('#ff7f0e')  # Orange
+            else:
+                bar.set_color('#d62728')  # Red
+
+        # Add labels
+        for i, (bar, count) in enumerate(zip(bars, counts)):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.2f}\n(n={count})',
+                   ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+        ax.set_xlabel(config['title'], fontsize=12)
+        ax.set_ylabel('Average Score', fontsize=12)
+        ax.set_title(f'Average Score by {config["title"]}', fontsize=13)
+        ax.set_xticks(range(len(bin_labels)))
+        ax.set_xticklabels(bin_labels, rotation=15, ha='right')
+        ax.set_ylim(0, 1.1)
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Threshold')
+        ax.grid(True, alpha=0.3, axis='y')
         ax.legend()
-        ax.grid(True, alpha=0.3)
 
-    plt.suptitle('Feature Distributions: Error vs. Perfect Score', fontsize=14)
+    plt.suptitle('Average Scores by Video Characteristics', fontsize=16)
     plt.tight_layout()
 
-    # Save
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_path = os.path.join(output_dir, 'scores_by_video_features.png')
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
+    print(f"  Saved scores by features plot")
 
-    print(f"  Saved feature distributions plot to: {output_path}")
 
-
-def generate_visualizations(merged_df, correlation_results, top_correlations, output_dir, top_n=10):
+def plot_error_report_basics(merged_df, error_report_path, output_dir):
     """
-    Generate all visualizations
+    Plot basic error report statistics
 
     Args:
         merged_df: Merged DataFrame
-        correlation_results: Dictionary of correlation results
-        top_correlations: List of top correlations
+        error_report_path: Path to error report JSON
         output_dir: Output directory
-        top_n: Number of top correlations to visualize
+    """
+    print("\nGenerating basic error report plots...")
+
+    # Load error report for summary stats
+    error_report = read_json(error_report_path)
+
+    # 1. Score Distribution
+    plt.figure(figsize=(10, 6))
+    score_counts = merged_df['score'].value_counts().sort_index()
+    colors = ['#d62728', '#ff7f0e', '#2ca02c']  # red, orange, green
+    bars = plt.bar(score_counts.index, score_counts.values, color=colors, alpha=0.7, edgecolor='black')
+
+    # Add count labels on bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{int(height)}',
+                ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    plt.xlabel('Score', fontsize=14)
+    plt.ylabel('Number of Questions', fontsize=14)
+    plt.title('Score Distribution', fontsize=16)
+    plt.xticks([0, 0.5, 1.0], ['0\n(Complete\nMismatch)', '0.5\n(Partial\nMatch)', '1.0\n(Perfect)'])
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'score_distribution.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved score distribution plot")
+
+    # 2. Error Category Frequency
+    plt.figure(figsize=(12, 6))
+    error_categories = {
+        'Hallucination': merged_df['has_hallucination'].sum(),
+        'Missing Information': merged_df['has_missing_info'].sum(),
+        'Partial Match': merged_df['is_partial_match'].sum()
+    }
+
+    categories = list(error_categories.keys())
+    counts = list(error_categories.values())
+    colors_palette = ['#e74c3c', '#3498db', '#1abc9c']
+
+    bars = plt.bar(categories, counts, color=colors_palette, alpha=0.7, edgecolor='black')
+
+    # Add count labels
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{int(height)}',
+                ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    plt.xlabel('Error Category', fontsize=14)
+    plt.ylabel('Frequency', fontsize=14)
+    plt.title('Error Category Frequency', fontsize=16)
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'error_category_frequency.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved error category frequency plot")
+
+    # 3. Error Categories by Question Type
+    if 'question_type' in merged_df.columns:
+        question_types = merged_df['question_type'].unique()
+        question_types = [qt for qt in question_types if qt != 'Unknown']
+
+        if len(question_types) > 0:
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            error_cols = {
+                'Hallucination': 'has_hallucination',
+                'Missing Info': 'has_missing_info',
+                'Partial Match': 'is_partial_match'
+            }
+
+            x = np.arange(len(question_types))
+            width = 0.15
+
+            for i, (label, col) in enumerate(error_cols.items()):
+                counts = [merged_df[merged_df['question_type'] == qt][col].sum()
+                         for qt in question_types]
+                offset = width * (i - len(error_cols)/2)
+                ax.bar(x + offset, counts, width, label=label, alpha=0.8)
+
+            ax.set_xlabel('Question Type', fontsize=13)
+            ax.set_ylabel('Error Count', fontsize=13)
+            ax.set_title('Error Categories by Question Type', fontsize=15)
+            ax.set_xticks(x)
+            ax.set_xticklabels(question_types, rotation=45, ha='right')
+            ax.legend(loc='upper right', fontsize=10)
+            ax.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'errors_by_question_type.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved errors by question type plot")
+
+    # 4. Score vs Error Type Heatmap
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create matrix: rows = scores, cols = error types
+    scores = [0, 0.5, 1.0]
+    error_types = ['Hallucination', 'Missing Info', 'Partial Match']
+    error_col_map = {
+        'Hallucination': 'has_hallucination',
+        'Missing Info': 'has_missing_info',
+        'Partial Match': 'is_partial_match'
+    }
+
+    matrix = []
+    for score in scores:
+        row = []
+        score_df = merged_df[merged_df['score'] == score]
+        total_count = len(score_df)
+        for error_type in error_types:
+            col = error_col_map[error_type]
+            error_count = score_df[col].sum()
+            percentage = (error_count / total_count * 100) if total_count > 0 else 0
+            row.append(percentage)
+        matrix.append(row)
+
+    sns.heatmap(matrix, annot=True, fmt='.1f', cmap='YlOrRd',
+                xticklabels=error_types, yticklabels=['Score 0', 'Score 0.5', 'Score 1.0'],
+                cbar_kws={'label': 'Percentage (%)'})
+    plt.title('Error Type Prevalence by Score', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'error_prevalence_by_score.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved error prevalence by score heatmap")
+
+
+def generate_visualizations(merged_df, output_dir, error_report_path):
+    """
+    Generate all visualizations (simplified - no correlation plots)
+
+    Args:
+        merged_df: Merged DataFrame
+        output_dir: Output directory
+        error_report_path: Path to error report JSON
     """
     print("\nGenerating visualizations...")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Correlation heatmap
-    plot_correlation_heatmap(
-        correlation_results,
-        os.path.join(output_dir, 'correlation_heatmap.png')
-    )
+    # 1. Basic error report visualizations
+    plot_error_report_basics(merged_df, error_report_path, output_dir)
 
-    # 2. Top correlations scatter plots
-    plot_top_correlations(
-        merged_df,
-        top_correlations,
-        os.path.join(output_dir, f'top_{top_n}_correlations.png'),
-        top_n=top_n
-    )
+    # 2. Error rates by video features (KEY PLOTS!)
+    plot_error_rates_by_features(merged_df, output_dir)
 
-    # 3. Score distribution plots
-    plot_score_distributions(merged_df, output_dir)
-
-    # 4. Feature distribution comparisons
-    plot_feature_distributions(
-        merged_df,
-        os.path.join(output_dir, 'feature_distributions_error_comparison.png')
-    )
+    # 3. Scores by video features
+    plot_score_by_features(merged_df, output_dir)
 
     print(f"\nAll visualizations saved to: {output_dir}")
 
@@ -544,61 +687,103 @@ def create_report(
     video_stats_path,
     error_report_path,
     merged_df,
-    video_agg_df,
-    correlation_results,
-    per_type_correlations,
-    top_correlations,
+    error_rates_analysis,
     output_path
 ):
     """
-    Create JSON correlation report
+    Create JSON report with error rate analysis by video features
 
     Args:
         video_stats_path: Path to video statistics
         error_report_path: Path to error report
-        merged_df: Merged DataFrame
-        video_agg_df: Video-level aggregated DataFrame
-        correlation_results: Overall correlation results
-        per_type_correlations: Per-question-type correlations
-        top_correlations: Top correlations list
+        merged_df: Merged DataFrame (question level)
+        error_rates_analysis: Results from analyze_error_rates_by_video_features
         output_path: Output JSON path
     """
     print("\nGenerating JSON report...")
 
-    # Compute summary statistics
-    videos_with_errors = (video_agg_df['score_mean'] < 1).sum()
-    videos_perfect_score = (video_agg_df['score_mean'] == 1).sum()
+    # Compute summary statistics at question level
+    total_questions = len(merged_df)
+    questions_with_errors = (merged_df['score'] < 1).sum()
+    questions_perfect = (merged_df['score'] == 1).sum()
 
-    # Error rate by video features
-    error_videos = video_agg_df[video_agg_df['score_mean'] < 1]
-    perfect_videos = video_agg_df[video_agg_df['score_mean'] == 1]
+    # Unique videos
+    unique_videos = merged_df['video_id'].nunique()
+
+    # Error questions vs perfect questions
+    error_questions = merged_df[merged_df['score'] < 1]
+    perfect_questions = merged_df[merged_df['score'] == 1]
+
+    # Summary stats
+    error_summary = {
+        'total_questions': int(total_questions),
+        'questions_with_errors': int(questions_with_errors),
+        'questions_perfect': int(questions_perfect),
+        'unique_videos': int(unique_videos),
+        'score_distribution': {
+            'score_0': int((merged_df['score'] == 0).sum()),
+            'score_0.5': int((merged_df['score'] == 0.5).sum()),
+            'score_1.0': int((merged_df['score'] == 1.0).sum())
+        },
+        'error_type_counts': {
+            'hallucinations': int(merged_df['has_hallucination'].sum()),
+            'missing_information': int(merged_df['has_missing_info'].sum()),
+            'partial_match': int(merged_df['is_partial_match'].sum())
+        }
+    }
+
+    # Feature comparison: error vs perfect
+    feature_comparison = {}
+    video_features = ['duration_seconds', 'frame_variance', 'motion_intensity',
+                     'brightness_mean', 'scene_complexity', 'color_diversity']
+
+    for feature in video_features:
+        if feature in merged_df.columns:
+            feature_comparison[feature] = {
+                'mean_error_questions': float(error_questions[feature].mean()) if len(error_questions) > 0 else 0,
+                'mean_perfect_questions': float(perfect_questions[feature].mean()) if len(perfect_questions) > 0 else 0,
+                'std_error_questions': float(error_questions[feature].std()) if len(error_questions) > 0 else 0,
+                'std_perfect_questions': float(perfect_questions[feature].std()) if len(perfect_questions) > 0 else 0
+            }
+
+    # Generate key insights
+    key_insights = []
+
+    # Duration insights
+    if 'duration_seconds' in error_rates_analysis:
+        duration_data = error_rates_analysis['duration_seconds']
+        for bin_label, stats in duration_data.items():
+            hallucination_rate = stats['error_rates'].get('hallucination', 0)
+            if hallucination_rate > 50:
+                key_insights.append(
+                    f"Videos {bin_label} have high hallucination rate: {hallucination_rate:.1f}%"
+                )
+
+    # Add feature comparison insights
+    for feature, comparison in feature_comparison.items():
+        diff_pct = abs(comparison['mean_error_questions'] - comparison['mean_perfect_questions'])
+        if diff_pct > 0:
+            direction = "higher" if comparison['mean_error_questions'] > comparison['mean_perfect_questions'] else "lower"
+            key_insights.append(
+                f"Error questions have {direction} {feature.replace('_', ' ')}: "
+                f"{comparison['mean_error_questions']:.2f} vs {comparison['mean_perfect_questions']:.2f}"
+            )
 
     report = {
         'metadata': {
             'analysis_date': datetime.now().isoformat(),
             'video_stats_file': video_stats_path,
             'error_report_file': error_report_path,
-            'total_videos': len(video_agg_df),
-            'total_questions': len(merged_df),
-            'questions_with_video_stats': len(merged_df)
+            'analysis_type': 'error_rates_by_video_features'
         },
-        'overall_correlations': {
-            'pearson': {k: {'r': v['pearson_r'], 'p': v['pearson_p'], 'significant': v['significant']}
-                        for k, v in correlation_results.items()},
-            'spearman': {k: {'r': v['spearman_r'], 'p': v['spearman_p']}
-                         for k, v in correlation_results.items()}
-        },
-        'per_question_type_correlations': per_type_correlations,
-        'top_significant_correlations': top_correlations,
-        'aggregated_statistics': {
-            'videos_with_errors': int(videos_with_errors),
-            'videos_perfect_score': int(videos_perfect_score),
-            'mean_video_duration_errors': float(error_videos['duration_seconds'].mean()) if len(error_videos) > 0 else 0,
-            'mean_video_duration_perfect': float(perfect_videos['duration_seconds'].mean()) if len(perfect_videos) > 0 else 0,
-            'mean_frame_variance_errors': float(error_videos['frame_variance'].mean()) if len(error_videos) > 0 else 0,
-            'mean_frame_variance_perfect': float(perfect_videos['frame_variance'].mean()) if len(perfect_videos) > 0 else 0
-        }
+        'summary': error_summary,
+        'error_rates_by_video_features': error_rates_analysis,
+        'feature_comparison': feature_comparison,
+        'key_insights': key_insights
     }
+
+    # Convert all numpy types to native Python types for JSON serialization
+    report = convert_to_native_types(report)
 
     # Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -609,21 +794,27 @@ def create_report(
 
     # Print summary
     print(f"\n{'='*70}")
-    print("CORRELATION ANALYSIS SUMMARY")
+    print("ERROR ANALYSIS SUMMARY")
     print(f"{'='*70}")
-    print(f"Total videos analyzed: {report['metadata']['total_videos']}")
-    print(f"Total questions: {report['metadata']['total_questions']}")
-    print(f"Videos with errors: {report['aggregated_statistics']['videos_with_errors']}")
-    print(f"Videos with perfect score: {report['aggregated_statistics']['videos_perfect_score']}")
-    print(f"\nTop {len(top_correlations)} Significant Correlations:")
-    for i, corr in enumerate(top_correlations[:5], 1):
-        print(f"  {i}. {corr['interpretation']}")
+    print(f"Total questions analyzed: {error_summary['total_questions']}")
+    print(f"Questions with errors: {error_summary['questions_with_errors']} ({error_summary['questions_with_errors']/error_summary['total_questions']*100:.1f}%)")
+    print(f"Questions with perfect score: {error_summary['questions_perfect']} ({error_summary['questions_perfect']/error_summary['total_questions']*100:.1f}%)")
+    print(f"Unique videos: {error_summary['unique_videos']}")
+    print(f"\nScore Distribution:")
+    for score_type, count in error_summary['score_distribution'].items():
+        print(f"  {score_type}: {count}")
+    print(f"\nError Type Counts:")
+    for error_type, count in error_summary['error_type_counts'].items():
+        print(f"  {error_type}: {count}")
+    print(f"\nKey Insights:")
+    for i, insight in enumerate(key_insights[:10], 1):
+        print(f"  {i}. {insight}")
     print(f"{'='*70}\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze correlations between video statistics and model errors"
+        description="Analyze how video characteristics relate to model errors"
     )
     parser.add_argument(
         '--video-stats',
@@ -638,10 +829,16 @@ def main():
         help='Path to error report JSON'
     )
     parser.add_argument(
+        '--groundtruth-file',
+        type=str,
+        default='/ivi/zfs/s0/original_homes/gmago/adsqa/AdsQA/AdsQA/testset_groundtruth.json',
+        help='Path to groundtruth JSON (to include perfect score questions)'
+    )
+    parser.add_argument(
         '--output-json',
         type=str,
-        default='./correlation_reports/qwen3vl-8b_correlations.json',
-        help='Output path for correlation report JSON'
+        default='./correlation_reports/qwen3vl-8b_analysis.json',
+        help='Output path for analysis report JSON'
     )
     parser.add_argument(
         '--output-plots-dir',
@@ -649,50 +846,26 @@ def main():
         default='./correlation_reports/qwen3vl-8b_plots/',
         help='Output directory for visualization plots'
     )
-    parser.add_argument(
-        '--min-p-value',
-        type=float,
-        default=0.05,
-        help='Significance threshold for correlations'
-    )
-    parser.add_argument(
-        '--top-n',
-        type=int,
-        default=10,
-        help='Number of top correlations to visualize'
-    )
 
     args = parser.parse_args()
 
     # Load and merge data
-    question_df, video_df, merged_df = merge_data(
+    _, _, merged_df = merge_data(
         args.video_stats,
-        args.error_report
+        args.error_report,
+        args.groundtruth_file if os.path.exists(args.groundtruth_file) else None
     )
 
-    # Aggregate to video level
-    video_agg_df = aggregate_to_video_level(merged_df)
-    print(f"\nVideo-level aggregation: {len(video_agg_df)} unique videos")
+    print(f"\nAnalyzing {len(merged_df)} questions from {merged_df['video_id'].nunique()} unique videos")
 
-    # Compute overall correlations
-    correlation_results = compute_correlations(video_agg_df, args.min_p_value)
-
-    # Compute per-question-type correlations
-    per_type_correlations = compute_per_question_type_correlations(
-        merged_df,
-        args.min_p_value
-    )
-
-    # Identify top correlations
-    top_correlations = identify_top_correlations(correlation_results, args.top_n)
+    # Analyze error rates by video features
+    error_rates_analysis = analyze_error_rates_by_video_features(merged_df)
 
     # Generate visualizations
     generate_visualizations(
         merged_df,
-        correlation_results,
-        top_correlations,
         args.output_plots_dir,
-        args.top_n
+        args.error_report
     )
 
     # Create JSON report
@@ -700,14 +873,11 @@ def main():
         args.video_stats,
         args.error_report,
         merged_df,
-        video_agg_df,
-        correlation_results,
-        per_type_correlations,
-        top_correlations,
+        error_rates_analysis,
         args.output_json
     )
 
-    print("\nCorrelation analysis complete!")
+    print("\nError analysis complete!")
 
 
 if __name__ == '__main__':

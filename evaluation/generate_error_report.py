@@ -66,8 +66,6 @@ def generate_comprehensive_report(
         "evaluated_questions": 0,
         "perfect_scores": 0,
         "error_summary": {
-            "Format Error": 0,
-            "Complete Mismatch": 0,
             "Partial Match": 0,
             "Hallucination": 0,
             "Missing Information": 0
@@ -133,21 +131,7 @@ def generate_comprehensive_report(
         # Categorize errors based on saved reasoning
         errors = []
 
-        # 1. Format check
-        if not ("<think>" in prediction and "</think>" in prediction and
-                "<answer>" in prediction and "</answer>" in prediction):
-            issues = []
-            if "<think>" not in prediction or "</think>" not in prediction:
-                issues.append("Missing <think> tags")
-            if "<answer>" not in prediction or "</answer>" not in prediction:
-                issues.append("Missing <answer> tags")
-            errors.append({
-                "category": "Format Error",
-                "detail": ", ".join(issues)
-            })
-            report["error_summary"]["Format Error"] += 1
-
-        # 2. Missing Information (from evaluation)
+        # 1. Missing Information (from evaluation)
         if missing_info and missing_info.strip():
             errors.append({
                 "category": "Missing Information",
@@ -155,7 +139,7 @@ def generate_comprehensive_report(
             })
             report["error_summary"]["Missing Information"] += 1
 
-        # 3. Hallucinations (from evaluation)
+        # 2. Hallucinations (from evaluation)
         if hallucinations and hallucinations.strip():
             errors.append({
                 "category": "Hallucination",
@@ -163,14 +147,8 @@ def generate_comprehensive_report(
             })
             report["error_summary"]["Hallucination"] += 1
 
-        # 4. Score-based categorization
-        if score == 0:
-            errors.append({
-                "category": "Complete Mismatch",
-                "detail": "Prediction has no overlap with ground truth"
-            })
-            report["error_summary"]["Complete Mismatch"] += 1
-        elif score == 0.5:
+        # 3. Partial Match (score-based categorization)
+        if score == 0.5:
             errors.append({
                 "category": "Partial Match",
                 "detail": "Contains some correct information but incomplete"
@@ -198,13 +176,15 @@ def generate_comprehensive_report(
     hallucination_count = report["error_summary"]["Hallucination"]
     missing_info_count = report["error_summary"]["Missing Information"]
 
+    partial_match_count = report["error_summary"]["Partial Match"]
+
     report["overall_insights"] = {
         "error_rate": (total_errors / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0,
         "perfect_score_rate": (report["perfect_scores"] / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0,
         "hallucination_prevalence": (hallucination_count / total_errors * 100) if total_errors > 0 else 0,
         "missing_information_prevalence": (missing_info_count / total_errors * 100) if total_errors > 0 else 0,
-        "primary_issue": "Hallucination" if hallucination_count > missing_info_count else "Missing Information" if missing_info_count > hallucination_count else "Both equally prevalent",
-        "format_error_rate": (report["error_summary"]["Format Error"] / report["evaluated_questions"] * 100) if report["evaluated_questions"] > 0 else 0
+        "partial_match_prevalence": (partial_match_count / total_errors * 100) if total_errors > 0 else 0,
+        "primary_issue": "Hallucination" if hallucination_count > max(missing_info_count, partial_match_count) else "Missing Information" if missing_info_count > max(hallucination_count, partial_match_count) else "Partial Match" if partial_match_count > max(hallucination_count, missing_info_count) else "Mixed"
     }
 
     # Save report

@@ -42,8 +42,6 @@ error_analysis:
   enabled: true
   output_dir: "./error_reports/"
   categories:
-    - "Format Error"
-    - "Complete Mismatch"
     - "Partial Match"
     - "Hallucination"
     - "Missing Information"
