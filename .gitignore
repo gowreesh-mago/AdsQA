@@ -1,1 +1,8 @@
 scene_graph/
+results/
+__pycache__/
+static/
+video_statistics/
+correlation_reports/
+error_reports/
+output.json

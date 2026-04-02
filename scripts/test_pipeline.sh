@@ -22,32 +22,31 @@ echo "Testing with $SAMPLES samples"
 echo "========================================================"
 echo ""
 
-# Step 1: Video Inference
-echo "Step 1/3: Running video inference with Qwen3-VL-8B..."
-echo "--------------------------------------------------------"
-python evaluation/eval_adQA_qwen3vl-8b.py \
-  --video_dir "$VIDEO_DIR" \
-  --asr_file "$ASR_FILE" \
-  --question_file "$QUESTION_FILE" \
-  --model_name qwen3vl-8b \
-  --max_samples $SAMPLES
+# # Step 1: Video Inference
+# echo "Step 1/3: Running video inference with Qwen3-VL-8B..."
+# echo "--------------------------------------------------------"
+# python evaluation/eval_adQA_qwen3vl-8b.py \
+#   --video_dir "$VIDEO_DIR" \
+#   --asr_file "$ASR_FILE" \
+#   --question_file "$QUESTION_FILE" \
+#   --model_name qwen3vl-8b \
+#   --max_samples $SAMPLES
 
-echo ""
-echo "✓ Inference complete!"
-echo ""
+# echo ""
+# echo "✓ Inference complete!"
+# echo ""
 
-# Step 2: Evaluation
-echo "Step 2/3: Running evaluation with Qwen2.5-7B-Instruct..."
-echo "--------------------------------------------------------"
-python evaluation/model_evaluation_qwen.py \
-  --eval_name qwen3vl-8b.json \
-  --test_file "$GROUNDTRUTH_FILE" \
-  --results_dir ./results/ \
-  --max_samples $SAMPLES
+# # Step 2: Evaluation
+# echo "Step 2/3: Running evaluation with Qwen2.5-7B-Instruct..."
+# echo "--------------------------------------------------------"
+# python evaluation/model_evaluation_qwen.py \
+#   --eval_name qwen3vl-8b.json \
+#   --test_file "$GROUNDTRUTH_FILE" \
+#   --results_dir ./results/ \
 
-echo ""
-echo "✓ Evaluation complete!"
-echo ""
+# echo ""
+# echo "✓ Evaluation complete!"
+# echo ""
 
 # Step 3: Error Report
 echo "Step 3/3: Generating error report..."
@@ -57,7 +56,6 @@ python evaluation/generate_error_report.py \
   --eval_name qwen3vl-8b.json \
   --groundtruth_file "$GROUNDTRUTH_FILE" \
   --output_path ./error_reports/qwen3vl-8b_test_${SAMPLES}_report.json \
-  --max_samples $SAMPLES
 
 echo ""
 echo "✓ Error report complete!"

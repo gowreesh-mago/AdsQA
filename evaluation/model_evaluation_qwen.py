@@ -7,11 +7,10 @@ import argparse
 import json
 import os
 import re
-import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
-from hallucination_verifier import HallucinationVerifier, LLMSemanticVerifier
+from hallucination_verifier import LLMSemanticVerifier
 
 
 # Enhanced evaluation prompt with robust formatting requirements
@@ -33,9 +32,11 @@ You are an expert evaluator comparing a model's answer against a ground truth an
 3. Check if Response contains ANY claims NOT present in Ground Truth
 
 ###Scoring:
-- 1: Response contains ALL key information and NO hallucinations
-- 0.5: Response contains SOME key information, NO hallucinations, but missing other key info
-- 0: Response is incorrect (missing most/all key info OR contains hallucinations)
+- 1: Response contains ALL key information from Ground Truth
+- 0.5: Response contains SOME key information from Ground Truth, but missing other key info
+- 0: Response is incorrect (missing most/all key information)
+
+Note: Hallucinations are tracked separately and do NOT affect the score. Score reflects only how much ground truth information is present.
 
 ###Output Format (EXACT format required):
 
@@ -212,6 +213,9 @@ if __name__ == '__main__':
     relaxed_acc = 0.
     strict_acc = 0.
 
+    # Track perfect score cases
+    perfect_score_cases = []
+
     # Evaluate each sample
     for ii, item in enumerate(tqdm(raw_test_data, desc="Evaluating")):
 
@@ -249,6 +253,17 @@ if __name__ == '__main__':
             if '1' in gptscore:
                 strict_acc += 1
                 relaxed_acc += 1
+                # Save perfect score case
+                perfect_score_cases.append({
+                    'question_id': question_id,
+                    'question': question,
+                    'question_type': question_types,
+                    'ground_truth': gt_answer,
+                    'prediction': pred_answer,
+                    'score': pred_score,
+                    'missing_info': pred_item[0].get('missing_info', ''),
+                    'hallucinations': pred_item[0].get('hallucinations', '')
+                })
             elif '0.5' in gptscore:
                 strict_acc += 0
                 relaxed_acc += 0.5
@@ -314,24 +329,7 @@ if __name__ == '__main__':
                 missing_verification['verified_missing']
             ) if missing_verification['verified_missing'] else ''
 
-            # VERIFICATION STEP 3: Verify partial match scoring (0.5) using LLM
-            if '0.5' in eval_result['score']:
-                # Use LLM to verify semantic overlap
-                overlap_check = verifier.verify_partial_match_llm(
-                    pred_answer, gt_answer, model, tokenizer
-                )
-
-                # Verify NO hallucinations
-                has_hallucinations = len(halluc_verification['verified_hallucinations']) > 0
-
-                if not overlap_check or has_hallucinations:
-                    # Invalid 0.5 score - downgrade to 0
-                    eval_result['score'] = 'Answer: 0'
-                    print(f"  WARNING: Corrected invalid 0.5 score to 0 for {question_id}")
-                    if not overlap_check:
-                        print(f"    Reason: No semantic overlap detected by LLM")
-                    if has_hallucinations:
-                        print(f"    Reason: Contains verified hallucinations")
+            # Score remains unchanged - no modifications after initial evaluation
 
             # Save verification details
             eval_result['hallucination_verification'] = halluc_verification
@@ -360,6 +358,17 @@ if __name__ == '__main__':
             if '1' in gptscore_clean:
                 strict_acc += 1
                 relaxed_acc += 1
+                # Save perfect score case
+                perfect_score_cases.append({
+                    'question_id': question_id,
+                    'question': question,
+                    'question_type': question_types,
+                    'ground_truth': gt_answer,
+                    'prediction': pred_answer,
+                    'score': eval_result['score'],
+                    'missing_info': eval_result['missing_info'],
+                    'hallucinations': eval_result['hallucinations']
+                })
             elif '0.5' in gptscore_clean:
                 strict_acc += 0
                 relaxed_acc += 0.5
@@ -410,3 +419,10 @@ if __name__ == '__main__':
     if len(raw_test_data) > 0:
         print(f"\nStrict accuracy: {strict_acc / len(raw_test_data):.4f}")
         print(f"Relaxed accuracy: {relaxed_acc / len(raw_test_data):.4f}")
+
+    # Save perfect score cases
+    if perfect_score_cases:
+        perfect_scores_path = os.path.join(args.results_dir, f'perfect_scores_{args.eval_name}')
+        with open(perfect_scores_path, 'w', encoding='utf-8') as ff:
+            json.dump(perfect_score_cases, ff, indent=4, ensure_ascii=False)
+        print(f"\nSaved {len(perfect_score_cases)} perfect score cases to: {perfect_scores_path}")

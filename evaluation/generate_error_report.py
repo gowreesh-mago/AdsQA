@@ -86,6 +86,7 @@ def generate_comprehensive_report(
 
         # Skip if prediction doesn't exist
         if not os.path.exists(pred_path):
+            print(f"\nWarning: Prediction file not found for question_id {question_id} at {pred_path}")
             continue
 
         try:
@@ -102,11 +103,18 @@ def generate_comprehensive_report(
         hallucinations = pred_data[0].get("hallucinations", "")
 
         if not prediction:
+            print(f"\nWarning: Empty prediction for question_id {question_id}")
             continue
 
         # Parse score
-        score_match = re.search(r"(\d+(?:\.\d+)?)", score_str)
+        # Parse score - explicitly match "Answer: X" format
+        score_match = re.search(r'Answer:\s*(0|0\.5|1)(?:\s|$)', score_str)
         score = float(score_match.group(1)) if score_match else None
+
+        # Debug: print if score parsing fails
+        if score is None and score_str:
+            print(f"\nWarning: Could not parse score from: '{score_str}' for {question_id}")
+
 
         report["evaluated_questions"] += 1
 
@@ -118,10 +126,6 @@ def generate_comprehensive_report(
         elif score == 1.0:
             report["score_distribution"]["score_1"] += 1
             report["perfect_scores"] += 1
-
-        # Skip perfect scores (no errors to analyze)
-        if score == 1.0:
-            continue
 
         # Get ground truth info
         ground_truth = item.get("answer", item.get("gt_answer", ""))
@@ -155,10 +159,12 @@ def generate_comprehensive_report(
             })
             report["error_summary"]["Partial Match"] += 1
 
-        # Analyze explanation differences
-        exp_analysis = explanation_analyzer.compare_explanations(prediction, item)
+        # Analyze explanation differences (skip for perfect scores to save time)
+        exp_analysis = None
+        if score != 1.0:
+            exp_analysis = explanation_analyzer.compare_explanations(prediction, item)
 
-        # Add to detailed errors
+        # Add to detailed errors (including perfect scores)
         report["detailed_errors"].append({
             "question_id": question_id,
             "question": item.get("question", ""),
@@ -170,6 +176,9 @@ def generate_comprehensive_report(
             "meta_info": meta_info,
             "explanation_analysis": exp_analysis
         })
+
+        if score == 1.0:
+            print(f"Question ID {question_id} {score} - Perfect score, saved to report.")
 
     # Add overall insights
     total_errors = len(report["detailed_errors"])
