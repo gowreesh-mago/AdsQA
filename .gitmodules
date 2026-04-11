@@ -1,0 +1,6 @@
+[submodule "external/TransNetV2"]
+	path = external/TransNetV2
+	url = https://github.com/soCzech/TransNetV2.git
+[submodule "external/lavad"]
+	path = external/lavad
+	url = https://github.com/lucazanella/lavad.git

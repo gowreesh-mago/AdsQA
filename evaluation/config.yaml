@@ -38,6 +38,23 @@ data:
   asr_file: "./evaluation/asr_set.json"
   testset_groundtruth: "./testset_groundtruth.json"
 
+transnet_lavad:
+  stage1:
+    transnet_weights: null  # null = auto-detect from submodule
+    threshold: 0.5
+    output_dir: "./transnet_frames/"
+  stage2:
+    captioner:
+      model: "Salesforce/blip2-opt-6.7b-coco"  # LavaD ImageCaptioner (BLIP-2)
+      batch_size: 8
+      dtype: "float16"
+    captions_dir: "./transnet_captions/"  # LavaD caption output
+    qna:
+      model: "Qwen/Qwen2.5-7B-Instruct"
+      max_new_tokens: 1524
+      temperature: 0.1
+  model_name: "transnet-lavad"
+
 error_analysis:
   enabled: true
   output_dir: "./error_reports/"
